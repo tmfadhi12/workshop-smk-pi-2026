@@ -1,5 +1,4 @@
-
-name: Laravel CI/CD
+name: Laravel ZIP deploy to Rumahweb
 
 on:
   push:
@@ -10,13 +9,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: laravel-production
+  group: production-deployment
   cancel-in-progress: false
 
 jobs:
-  test-build-deploy:
+  deploy:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,30 +24,20 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.4'
-          extensions: mbstring, xml, curl, zip, pdo_sqlite, sqlite3
+          extensions: mbstring, xml, curl, zip, pdo_sqlite
           tools: composer:v2
           coverage: none
 
-      - name: Composer install
-        run: composer install --no-interaction --prefer-dist
+      - name: Install PHP dependencies for tests
+        run: composer install --no-interaction --prefer-dist --no-progress
 
-      - name: Setup test environment
-        run: |
-          cp .env.example .env
-          php artisan key:generate
-          touch database/database.sqlite
-
-      - name: Run tests
-        env:
-          APP_ENV: testing
-          DB_CONNECTION: sqlite
-          DB_DATABASE: database/database.sqlite
-          SESSION_DRIVER: array
-          CACHE_STORE: array
-          QUEUE_CONNECTION: sync
+      - name: Run Laravel tests
         run: php artisan test
 
-      - name: Setup Node
+      - name: Install production PHP dependencies
+        run: composer install --no-dev --no-interaction --prefer-dist --no-progress --optimize-autoloader
+
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -59,62 +48,81 @@ jobs:
           npm ci
           npm run build
 
-      - name: Install production dependencies
+      - name: Package private and public archives
         run: |
-          composer install --no-dev --optimize-autoloader \
-            --prefer-dist --no-interaction
-
-      - name: Package application
-        run: |
-          mkdir -p .deploy/app .deploy/public
-
+          set -euo pipefail
+          mkdir -p .deploy/app .deploy/public .deploy/artifacts
           rsync -a ./ .deploy/app/ \
-            --exclude='.deploy/' \
-            --exclude='.git/' \
-            --exclude='.github/' \
-            --exclude='.env' \
-            --exclude='node_modules/' \
-            --exclude='tests/' \
-            --exclude='deploy/' \
-            --exclude='storage/' \
-            --exclude='bootstrap/cache/*.php'
-
-          rsync -a public/ .deploy/public/
-          cp deploy/index.php .deploy/public/index.php
+            --exclude='/.deploy/' \
+            --exclude='/.git/' \
+            --exclude='/.github/' \
+            --exclude='/.env' \
+            --exclude='/.env.*' \
+            --exclude='/node_modules/' \
+            --exclude='/storage/' \
+            --exclude='/tests/' \
+            --exclude='/deploy/' \
+            --exclude='/bootstrap/cache/*.php'
+          rsync -a public/ .deploy/public/ \
+            --exclude='/index.php' \
+            --exclude='/__deploy.php'
+          # ZIP runner rejects symbolic links for safety.
+          if find .deploy/app .deploy/public -type l -print -quit | grep -q .; then
+            echo 'Symlinks found in build artifacts; inspect before deploying.' >&2
+            exit 1
+          fi
+          (cd .deploy/app && zip -qr "../artifacts/${GITHUB_SHA}-app.zip" .)
+          (cd .deploy/public && zip -qr "../artifacts/${GITHUB_SHA}-public.zip" .)
+          sha256sum .deploy/artifacts/*.zip
 
       - name: Install lftp
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y lftp
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq lftp
 
-      - name: Deploy private Laravel app
+      - name: Upload both ZIPs via verified FTPS
         env:
           HOST: ${{ secrets.FTP_HOST }}
           USER: ${{ secrets.FTP_APP_USERNAME }}
           PASS: ${{ secrets.FTP_APP_PASSWORD }}
         run: |
-          lftp -u "$USER","$PASS" "$HOST" <<'LFTP'
+          set -euo pipefail
+          lftp -u "$USER","$PASS" "ftp://$HOST" <<LFTP
           set cmd:fail-exit true
           set ftp:ssl-force true
           set ftp:ssl-protect-data true
           set ssl:verify-certificate true
           set ftp:passive-mode true
-          mirror -R --parallel=2 .deploy/app/ .
+          set net:timeout 30
+          set net:max-retries 3
+          mkdir -p .deploy/incoming
+          put .deploy/artifacts/${GITHUB_SHA}-app.zip -o .deploy/incoming/${GITHUB_SHA}-app.zip
+          put .deploy/artifacts/${GITHUB_SHA}-public.zip -o .deploy/incoming/${GITHUB_SHA}-public.zip
           bye
           LFTP
 
-      - name: Deploy public files
-        env:
-          HOST: ${{ secrets.FTP_HOST }}
-          USER: ${{ secrets.FTP_PUBLIC_USERNAME }}
-          PASS: ${{ secrets.FTP_PUBLIC_PASSWORD }}
-        run: |
-          lftp -u "$USER","$PASS" "$HOST" <<'LFTP'
-          set cmd:fail-exit true
-          set ftp:ssl-force true
-          set ftp:ssl-protect-data true
-          set ssl:verify-certificate true
-          set ftp:passive-mode true
-          mirror -R --parallel=2 .deploy/public/ .
-          bye
-          LFTP
+      # - name: Trigger authenticated PHP deployment
+      #   env:
+      #     DEPLOY_SECRET: ${{ secrets.DEPLOY_SECRET }}
+      #   run: |
+      #     set -euo pipefail
+      #     TS=$(date +%s)
+      #     NONCE=$(openssl rand -hex 16)
+      #     APP_HASH=$(sha256sum ".deploy/artifacts/${GITHUB_SHA}-app.zip" | awk '{print $1}')
+      #     PUBLIC_HASH=$(sha256sum ".deploy/artifacts/${GITHUB_SHA}-public.zip" | awk '{print $1}')
+      #     MESSAGE=$(printf '%s\n%s\n%s\n%s\n%s' "$TS" "$GITHUB_SHA" "$APP_HASH" "$PUBLIC_HASH" "$NONCE")
+      #     SIGNATURE=$(printf '%s' "$MESSAGE" | openssl dgst -sha256 -hmac "$DEPLOY_SECRET" -r | awk '{print $1}')
+      #     curl --fail-with-body --silent --show-error \
+      #       --connect-timeout 20 --max-time 240 \
+      #       -X POST 'https://workshop.tmfadhli.my.id/__deploy.php' \
+      #       -H "X-Deploy-Timestamp: $TS" \
+      #       -H "X-Deploy-Sha: $GITHUB_SHA" \
+      #       -H "X-Deploy-App-Hash: $APP_HASH" \
+      #       -H "X-Deploy-Public-Hash: $PUBLIC_HASH" \
+      #       -H "X-Deploy-Nonce: $NONCE" \
+      #       -H "X-Deploy-Signature: $SIGNATURE"
+
+      # - name: Verify Laravel is live
+      #   run: |
+      #     curl --fail --silent --show-error \
+      #       --retry 3 --retry-delay 3 --retry-all-errors \
+      #       --connect-timeout 15 --max-time 30 \
+      #       https://workshop.tmfadhli.my.id/up >/dev/null
