@@ -1,0 +1,120 @@
+
+name: Laravel CI/CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: laravel-production
+  cancel-in-progress: false
+
+jobs:
+  test-build-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, xml, curl, zip, pdo_sqlite, sqlite3
+          tools: composer:v2
+          coverage: none
+
+      - name: Composer install
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Setup test environment
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+          touch database/database.sqlite
+
+      - name: Run tests
+        env:
+          APP_ENV: testing
+          DB_CONNECTION: sqlite
+          DB_DATABASE: database/database.sqlite
+          SESSION_DRIVER: array
+          CACHE_STORE: array
+          QUEUE_CONNECTION: sync
+        run: php artisan test
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Build frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install production dependencies
+        run: |
+          composer install --no-dev --optimize-autoloader \
+            --prefer-dist --no-interaction
+
+      - name: Package application
+        run: |
+          mkdir -p .deploy/app .deploy/public
+
+          rsync -a ./ .deploy/app/ \
+            --exclude='.deploy/' \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='.env' \
+            --exclude='node_modules/' \
+            --exclude='tests/' \
+            --exclude='deploy/' \
+            --exclude='storage/' \
+            --exclude='bootstrap/cache/*.php'
+
+          rsync -a public/ .deploy/public/
+          cp deploy/index.php .deploy/public/index.php
+
+      - name: Install lftp
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lftp
+
+      - name: Deploy private Laravel app
+        env:
+          HOST: ${{ secrets.FTP_HOST }}
+          USER: ${{ secrets.FTP_APP_USERNAME }}
+          PASS: ${{ secrets.FTP_APP_PASSWORD }}
+        run: |
+          lftp -u "$USER","$PASS" "$HOST" <<'LFTP'
+          set cmd:fail-exit true
+          set ftp:ssl-force true
+          set ftp:ssl-protect-data true
+          set ssl:verify-certificate true
+          set ftp:passive-mode true
+          mirror -R --parallel=2 .deploy/app/ .
+          bye
+          LFTP
+
+      - name: Deploy public files
+        env:
+          HOST: ${{ secrets.FTP_HOST }}
+          USER: ${{ secrets.FTP_PUBLIC_USERNAME }}
+          PASS: ${{ secrets.FTP_PUBLIC_PASSWORD }}
+        run: |
+          lftp -u "$USER","$PASS" "$HOST" <<'LFTP'
+          set cmd:fail-exit true
+          set ftp:ssl-force true
+          set ftp:ssl-protect-data true
+          set ssl:verify-certificate true
+          set ftp:passive-mode true
+          mirror -R --parallel=2 .deploy/public/ .
+          bye
+          LFTP
